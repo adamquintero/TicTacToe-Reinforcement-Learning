@@ -19,10 +19,13 @@ from gym_tictactoe.env import TicTacToeEnv, set_log_level_by, agent_by_mark,\
     next_mark, check_game_status, after_action_state, O_REWARD, X_REWARD
 from human_agent import HumanAgent
 from base_agent import BaseAgent
+from minimax_stochastic import MinimaxStochastic
+from minimax_deterministic import MinimaxDeterministic
+from minimax_draft import MinimaxDraft
 
 
 DEFAULT_VALUE = 0
-EPISODE_CNT = 17000
+EPISODE_CNT = 100000
 BENCH_EPISODE_CNT = 3000
 MODEL_FILE = 'best_td_agent.dat'
 EPSILON = 0.08
@@ -159,7 +162,7 @@ class TDAgent(object):
 
         val = self.ask_value(state)
         nval = self.ask_value(nstate)
-        diff = nval - val
+        diff = nval - val             
         val2 = val + self.alpha * diff
 
         logging.debug("  value from {:0.2f} to {:0.2f}".format(val, val2))
@@ -187,35 +190,128 @@ def cli(ctx, verbose):
 @click.option('-f', '--save-file', default=MODEL_FILE, show_default=True,
               help="Save model data as file name.")
 def learn(max_episode, epsilon, alpha, save_file):
+    # Load the model if it already exists
+    if os.path.exists(save_file):
+        print(f"Loading model from {save_file}...")
+        load_model(save_file)
+    else:
+        reset_state_values()  # Reset if no model file exists
+    
+    # Proceed with learning and save the updated model
     _learn(max_episode, epsilon, alpha, save_file)
 
 
 def _learn(max_episode, epsilon, alpha, save_file):
     """Learn by episodes.
 
-    Make two TD agent, and repeat self play for given episode count.
-    Update state values as reward coming from the environment.
+    Make two TD agents and repeat self-play for the given episode count.
+    Update state values as rewards are received from the environment.
 
     Args:
         max_episode (int): Episode count.
         epsilon (float): Probability of exploration.
         alpha (float): Step size.
-        save_file: File name to save result.
+        save_file (str): File name to save the result.
     """
-    reset_state_values()
-
     env = TicTacToeEnv()
-    agents = [TDAgent('O', epsilon, alpha),
-              TDAgent('X', epsilon, alpha)]
+    agents = [TDAgent('X', epsilon, alpha), MinimaxDeterministic('O')]
+    # agents = [TDAgent('X', epsilon, alpha), TDAgent('O', epsilon, alpha)]
 
     start_mark = 'O'
     for i in tqdm(range(max_episode)):
         episode = i + 1
         env.show_episode(False, episode)
 
-        # reset agent for new episode
-        for agent in agents:
-            agent.episode_rate = episode / float(max_episode)
+        # Adjust the exploration rate per episode
+        # for agent in agents:
+            # agent.episode_rate = episode / float(max_episode)
+
+        env.set_start_mark(start_mark)
+        state = env.reset()
+        _, mark = state
+        done = False
+        while not done:
+            agent = agent_by_mark(agents, mark)
+            ava_actions = env.available_actions()
+            env.show_turn(False, mark)
+            action = agent.act(state, ava_actions)
+
+            # Update the agent's value function if it's a TDAgent
+            nstate, reward, done, info = env.step(action)
+            if isinstance(agent, TDAgent):
+                agent.backup(state, nstate, reward)
+
+            if done:
+                env.show_result(False, mark, reward)
+                set_state_value(state, reward)  # Set terminal state value
+
+            _, mark = state = nstate
+
+        # Rotate the starting mark
+        start_mark = next_mark(start_mark)
+
+    # Save the updated model
+    save_model(save_file, max_episode, epsilon, alpha)
+    # print(f"Model saved to {save_file}")
+
+
+@cli.command(help="Learn against an existing model and save the new model.")
+@click.option('-p', '--episode', "max_episode", default=EPISODE_CNT,
+              show_default=True, help="Episode count.")
+@click.option('-e', '--epsilon', "epsilon", default=EPSILON,
+              show_default=True, help="Exploring factor.")
+@click.option('-a', '--alpha', "alpha", default=ALPHA,
+              show_default=True, help="Step size.")
+@click.option('-f', '--save-file', default=MODEL_FILE, show_default=True,
+              help="Save model data as file name.")
+@click.option('-m', '--model-file', "learned_model_file", required=True,
+              help="File name of the pre-existing learned model to load.")
+@click.option('-n', '--existing-agent', "existing_agent_file", default=None,
+              help="File name of the pre-existing agent to continue learning, if available.")
+def learnagainst(max_episode, epsilon, alpha, save_file, learned_model_file, existing_agent_file):
+    _learnagainst(max_episode, epsilon, alpha, save_file, learned_model_file, existing_agent_file)
+
+def _learnagainst(max_episode, epsilon, alpha, save_file, learned_model_file, existing_agent_file=None):
+    """Learn by episodes against an already learned model.
+
+    Use an existing agent if provided or create a new agent, and have it play against an already learned model.
+    Update state values as rewards are received from the environment.
+
+    Args:
+        max_episode (int): Episode count.
+        epsilon (float): Probability of exploration.
+        alpha (float): Step size.
+        save_file: File name to save result.
+        learned_model_file: File name of the pre-existing learned model to load.
+        existing_agent_file: File name of the existing agent to continue learning (optional).
+    """
+    reset_state_values()
+
+    env = TicTacToeEnv()
+
+    # Use an existing agent if provided, otherwise create a new agent
+    if existing_agent_file:
+        load_model(existing_agent_file)
+        new_agent = TDAgent('O', epsilon, alpha)
+    else:
+        new_agent = TDAgent('O', epsilon, alpha)
+
+    # Load the pre-existing learned model and create a TD agent with it
+    if learned_model_file:
+        load_model(learned_model_file)
+        learned_agent = TDAgent('X', 0, 0)  # Set epsilon and alpha to 0 to prevent exploration
+    else:
+        raise ValueError("A learned model file must be provided.")
+
+    agents = [new_agent, learned_agent]
+
+    start_mark = 'O'
+    for i in tqdm(range(max_episode)):
+        episode = i + 1
+        env.show_episode(False, episode)
+
+        # reset new agent for the new episode
+        new_agent.episode_rate = episode / float(max_episode)
 
         env.set_start_mark(start_mark)
         state = env.reset()
@@ -255,6 +351,7 @@ def save_model(save_file, max_episode, epsilon, alpha):
         for state, value in st_values.items():
             vcnt = st_visits[state]
             f.write('{}\t{:0.3f}\t{}\n'.format(state, value, vcnt))
+
 
 
 def load_model(filename):
@@ -361,28 +458,44 @@ def _learnbench(max_episode, max_bench_episode, epsilon, alpha, model_file,
     return _bench(max_bench_episode, model_file, show)
 
 
-@cli.command(help="Benchmark agent with base agent.")
+@cli.command(help="Benchmark agent with base agent or another learned agent.")
 @click.option('-p', '--episode', "max_episode", default=BENCH_EPISODE_CNT,
               show_default=True, help="Episode count.")
 @click.option('-f', '--model-file', default=MODEL_FILE, show_default=True,
               help="Model data file name.")
-def bench(model_file, max_episode):
-    _bench(max_episode, model_file)
+@click.option('-o', '--opponent-file', "learned_opponent_file", default=None,
+              help="Optional: File name of a second learned model to play against.")
+def bench(model_file, max_episode, learned_opponent_file):
+    _bench(max_episode, model_file, learned_opponent_file)
 
 
-def _bench(max_episode, model_file, show_result=True):
+def _bench(max_episode, model_file, learned_opponent_file=None, show_result=True):
     """Benchmark given model.
 
     Args:
         max_episode (int): Episode count to benchmark.
         model_file (str): Learned model file name to benchmark.
+        learned_opponent_file (str): Optional learned opponent agent file.
         show_result (bool): Output result to stdout.
 
     Returns:
         (dict): Benchmark result.
     """
     minfo = load_model(model_file)
-    agents = [BaseAgent('O'), TDAgent('X', 0, 0)]
+    
+    if learned_opponent_file:
+        load_model(learned_opponent_file)
+        opponent_agent = TDAgent('O', 0, 0)
+    else:
+        #opponent_agent = BaseAgent('O')
+        opponent_agent = MinimaxDeterministic('O')
+        #opponent_agent = MinimaxStochastic('O')
+        #opponent_agent = MinimaxDraft('O')
+        #opponent_agent = MinimaxAlpha('O')
+
+    learned_agent = TDAgent('X', 0, 0)
+
+    agents = [opponent_agent, learned_agent]
     show = False
 
     start_mark = 'O'
